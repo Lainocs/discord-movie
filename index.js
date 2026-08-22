@@ -43,13 +43,13 @@ async function getWatchlist(username) {
     }
 
     const $ = cheerio.load(html);
-    const posters = $('.poster-container .film-poster');
+    const posters = $('[data-target-link][data-item-full-display-name]');
 
     if (posters.length === 0) break;
 
     posters.each((_, el) => {
-      const slug = $(el).attr('data-target-link'); // ex: /film/parasite-2019/
-      const title = $(el).find('img').attr('alt');
+      const slug = $(el).attr('data-target-link'); // ex: /film/jaws/
+      const title = $(el).attr('data-item-full-display-name'); // ex: "Jaws (1975)"
       if (title && slug) {
         films.push({ title, slug });
       }
@@ -62,13 +62,25 @@ async function getWatchlist(username) {
   return films;
 }
 
+// ---- Extrait "Titre (Annee)" en { title, year } ----
+function parseTitleAndYear(fullTitle) {
+  const match = fullTitle.match(/^(.*)\s\((\d{4})\)$/);
+  if (match) {
+    return { title: match[1].trim(), year: match[2] };
+  }
+  return { title: fullTitle.trim(), year: null };
+}
+
 // ---- Recherche des infos du film sur TMDb (synopsis, note, affiche) ----
-async function getTmdbInfo(title) {
+async function getTmdbInfo(fullTitle) {
+  const { title, year } = parseTitleAndYear(fullTitle);
+
   const res = await axios.get('https://api.themoviedb.org/3/search/movie', {
     params: {
       api_key: TMDB_API_KEY,
       query: title,
       language: 'fr-FR',
+      ...(year ? { year } : {}),
     },
   });
 

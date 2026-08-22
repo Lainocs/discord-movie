@@ -18,13 +18,16 @@ const {
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// Sessions en memoire : userId -> { films, pick, seen: Set<slug> }
-// Permet de "Changer" sans re-scraper Letterboxd a chaque clic, et d'eviter
-// de reproposer deux fois le meme film pendant une meme session.
+// Sessions en memoire : userId -> { pick, totalCount }
 const sessions = new Map();
 
+// Cache de la watchlist en memoire pour ne pas re-scraper a chaque frappe
+// pendant l'autocomplete. Se rafraichit automatiquement au bout de CACHE_TTL_MS.
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+let watchlistCache = { films: [], fetchedAt: 0 };
+
 // ---- Scraping de la watchlist Letterboxd (publique, pas besoin d'API) ----
-async function getWatchlist(username) {
+async function fetchWatchlist(username) {
   const films = [];
   let page = 1;
 
@@ -62,6 +65,20 @@ async function getWatchlist(username) {
   return films;
 }
 
+// ---- Renvoie la watchlist en cache, en la rafraichissant si trop vieille ----
+async function getCachedWatchlist() {
+  const isStale = Date.now() - watchlistCache.fetchedAt > CACHE_TTL_MS;
+
+  if (isStale || watchlistCache.films.length === 0) {
+    const films = await fetchWatchlist(LETTERBOXD_USERNAME);
+    if (films.length > 0) {
+      watchlistCache = { films, fetchedAt: Date.now() };
+    }
+  }
+
+  return watchlistCache.films;
+}
+
 // ---- Extrait "Titre (Annee)" en { title, year } ----
 function parseTitleAndYear(fullTitle) {
   const match = fullTitle.match(/^(.*)\s\((\d{4})\)$/);
@@ -87,14 +104,7 @@ async function getTmdbInfo(fullTitle) {
   return res.data.results?.[0] || null;
 }
 
-// ---- Choisit un film pas encore vu dans la session en cours ----
-function pickRandomFilm(films, seen) {
-  const remaining = films.filter((f) => !seen.has(f.slug));
-  const pool = remaining.length > 0 ? remaining : films; // si tout a ete vu, on relache la contrainte
-  return pool[Math.floor(Math.random() * pool.length)];
-}
-
-// ---- Construit l'embed a partir d'un film pioche ----
+// ---- Construit l'embed a partir d'un film choisi ----
 async function buildFilmEmbed(pick, totalCount) {
   const info = await getTmdbInfo(pick.title);
   const letterboxdUrl = `https://letterboxd.com${pick.slug}`;
@@ -120,23 +130,18 @@ async function buildFilmEmbed(pick, totalCount) {
     embed.setDescription(`**${pick.title}**\n\nAucune info TMDb trouvee pour ce titre.`);
   }
 
-  embed.setFooter({ text: `Pioche parmi ${totalCount} films de la watchlist` });
+  embed.setFooter({ text: `Choisi parmi ${totalCount} films de la watchlist` });
 
   return { embed, info };
 }
 
-// ---- Boutons Poster / Changer ----
+// ---- Bouton Poster ----
 function buildButtons(disabled = false) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('film_post')
       .setLabel('Poster')
       .setStyle(ButtonStyle.Success)
-      .setDisabled(disabled),
-    new ButtonBuilder()
-      .setCustomId('film_change')
-      .setLabel('Changer')
-      .setStyle(ButtonStyle.Secondary)
       .setDisabled(disabled),
   );
 }
@@ -146,12 +151,32 @@ client.once('ready', () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
+  // ---- Autocomplete pendant que l'utilisateur tape le titre ----
+  if (interaction.isAutocomplete()) {
+    const focusedValue = interaction.options.getFocused().toLowerCase();
+
+    try {
+      const films = await getCachedWatchlist();
+
+      const matches = films
+        .filter((f) => f.title.toLowerCase().includes(focusedValue))
+        .slice(0, 25)
+        .map((f) => ({ name: f.title, value: f.slug }));
+
+      await interaction.respond(matches);
+    } catch (err) {
+      console.error(err);
+      await interaction.respond([]);
+    }
+    return;
+  }
+
   // ---- Commande /film ----
   if (interaction.isChatInputCommand() && interaction.commandName === 'film') {
     await interaction.deferReply({ ephemeral: true });
 
     try {
-      const films = await getWatchlist(LETTERBOXD_USERNAME);
+      const films = await getCachedWatchlist();
 
       if (films.length === 0) {
         await interaction.editReply(
@@ -160,13 +185,26 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const seen = new Set();
-      const pick = pickRandomFilm(films, seen);
-      seen.add(pick.slug);
+      const selectedSlug = interaction.options.getString('titre');
+      let pick = films.find((f) => f.slug === selectedSlug);
+
+      // Si l'utilisateur a valide sans choisir une suggestion, on retente une
+      // correspondance approximative sur le texte tape.
+      if (!pick) {
+        const typed = selectedSlug.toLowerCase();
+        pick = films.find((f) => f.title.toLowerCase().includes(typed));
+      }
+
+      if (!pick) {
+        await interaction.editReply(
+          "Je n'ai pas trouve ce film dans la watchlist. Retape /film et choisis un titre dans les suggestions proposees.",
+        );
+        return;
+      }
 
       const { embed } = await buildFilmEmbed(pick, films.length);
 
-      sessions.set(interaction.user.id, { films, pick, seen });
+      sessions.set(interaction.user.id, { pick, totalCount: films.length });
 
       await interaction.editReply({ embeds: [embed], components: [buildButtons()] });
     } catch (err) {
@@ -178,64 +216,41 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  // ---- Boutons ----
-  if (interaction.isButton()) {
+  // ---- Bouton Poster ----
+  if (interaction.isButton() && interaction.customId === 'film_post') {
     const session = sessions.get(interaction.user.id);
 
     if (!session) {
       await interaction.reply({
-        content: "Cette session a expire, relance /film pour en piocher un nouveau.",
+        content: "Cette session a expire, relance /film pour en choisir un nouveau.",
         ephemeral: true,
       });
       return;
     }
 
-    if (interaction.customId === 'film_change') {
-      await interaction.deferUpdate();
+    await interaction.deferUpdate();
 
-      try {
-        const pick = pickRandomFilm(session.films, session.seen);
-        session.seen.add(pick.slug);
-        session.pick = pick;
+    try {
+      const { embed } = await buildFilmEmbed(session.pick, session.totalCount);
+      embed.setTitle('On regarde ca ce soir !');
 
-        const { embed } = await buildFilmEmbed(pick, session.films.length);
+      // Message public dans le channel
+      await interaction.channel.send({ embeds: [embed] });
 
-        await interaction.editReply({ embeds: [embed], components: [buildButtons()] });
-      } catch (err) {
-        console.error(err);
-        await interaction.followUp({
-          content: "Erreur en piochant un nouveau film, reessaie.",
-          ephemeral: true,
-        });
-      }
-      return;
-    }
+      // On confirme dans le message ephemere et on desactive le bouton
+      await interaction.editReply({
+        content: 'Poste dans le channel !',
+        embeds: [embed],
+        components: [buildButtons(true)],
+      });
 
-    if (interaction.customId === 'film_post') {
-      await interaction.deferUpdate();
-
-      try {
-        const { embed } = await buildFilmEmbed(session.pick, session.films.length);
-        embed.setTitle('On regarde ca ce soir !');
-
-        // Message public dans le channel
-        await interaction.channel.send({ embeds: [embed] });
-
-        // On confirme dans le message ephemere et on desactive les boutons
-        await interaction.editReply({
-          content: 'Poste dans le channel !',
-          embeds: [embed],
-          components: [buildButtons(true)],
-        });
-
-        sessions.delete(interaction.user.id);
-      } catch (err) {
-        console.error(err);
-        await interaction.followUp({
-          content: "Erreur en postant le film, reessaie.",
-          ephemeral: true,
-        });
-      }
+      sessions.delete(interaction.user.id);
+    } catch (err) {
+      console.error(err);
+      await interaction.followUp({
+        content: "Erreur en postant le film, reessaie.",
+        ephemeral: true,
+      });
     }
   }
 });

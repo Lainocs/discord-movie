@@ -4,7 +4,14 @@ const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 const commands = [
   new SlashCommandBuilder()
     .setName('film')
-    .setDescription('Pioche un film aleatoire dans la watchlist Letterboxd et poste ses infos')
+    .setDescription('Choisis un film dans la watchlist Letterboxd et poste ses infos')
+    .addStringOption((option) =>
+      option
+        .setName('titre')
+        .setDescription('Cherche un film dans ta watchlist')
+        .setRequired(true)
+        .setAutocomplete(true),
+    )
     .toJSON(),
 ];
 
